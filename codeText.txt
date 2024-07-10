@@ -1,0 +1,879 @@
+# Team Members:-
+# Dhruv Mittal (DXM220015)
+# SIMRANPAL Singh (SXX210010)
+# Tarun Teja Obbina (TXO220011)
+# Vageesha Datta Ganapaneni (VXG210079)
+
+
+from pyspark.sql.functions import pandas_udf, lit, array, mean,rand
+import numpy as np
+import pandas as pd
+import random
+dataset = spark.read.format("csv").option("header", "true").load("dbfs:/FileStore/shared_uploads/dxm220015@utdallas.edu/dataset.csv")
+
+
+dataset = dataset.select("order_id", "user_id", "order_dow","order_hour_of_day","department_id","department","product_name")
+
+shuffled_df = dataset.orderBy(rand())
+df=shuffled_df
+
+df1=df.drop("days_since_prior_order","product_id","add_to_cart_order","reordered")
+
+
+from pyspark.sql.functions import when,col
+
+
+mapped_df = df.withColumn("order_dow_updated", 
+                          when(df["order_dow"].isin([0, 1]), 0)
+                          .when(df["order_dow"].isin([2, 3, 4]), 1)
+                          .otherwise(2))
+
+
+mapped_df1=mapped_df.withColumn("days",
+                                when(df["order_dow"].isin([0]),"Monday")
+                                .when(df["order_dow"].isin([1]),"Tuesday")
+                                .when(df["order_dow"].isin([2]),"Wednesday")
+                                .when(df["order_dow"].isin([3]),"Thursday")
+                                .when(df["order_dow"].isin([4]),"Friday")
+                                .when(df["order_dow"].isin([5]),"Saturday")
+                                .when(df["order_dow"].isin([6]),"Sunday")
+                                .otherwise("None")
+                                )
+
+
+
+# function to check if the given two list of centroids are same or not
+def is_clusters_same(c1, c2):
+    n1 = np.array(c1)
+    n2 = np.array(c2)
+    return np.array_equal(c1, c2) # if they are same return True: else False
+
+
+# function to initialze the centroids based on the K value and dataset
+def initialize_centroids_1(df, k):
+    # randomly pick K rows from the dataset as the initial centroids
+    sampled_df = df.orderBy(rand()).limit(k)
+    return sampled_df.collect()
+
+
+
+# function to calculate the euclidian distance between given point and the list of centroids
+def calculate_distance_and_assign_centroid(point, centroids):
+    # start with a minimum distance of +ve infinity
+    min_distance = float('inf')
+    for i in range(len(centroids)):
+        # find euclidian distance between the point and the centroid
+        distance = sum([(p1 - p2)**2 for p1, p2 in zip(point, centroids[i])]) ** 0.5
+        # if the distance is less than the current minimum distance
+        # update the minimum distance value and closter cluster index
+        if distance < min_distance:
+            min_distance = distance
+            closest_cluster = i  
+    return closest_cluster
+
+
+
+
+
+# Implementation of K Means Algorithm in Map Reduce Paradigm
+def kmeans(df, k, max_iter):
+    # convert the given dataframe into plain RDD and change the datatype from row to list
+    rdd = df.rdd.map(lambda x: list(x))
+    # add index to each instance
+    rdd_index = rdd.zipWithIndex().map(lambda x: (x[1], x[0]))
+    # fetch the starting centroids
+    # centroids = initialize_centroids(k, len(df.columns))
+    centroids = initialize_centroids_1(df, k)
+    # for each iteration
+    print("Starting Centroids:", centroids)
+    for _ in range(max_iter):
+        # for each instance add centroids list -> (index, (row data [point], list of centroids))
+        rdd_with_centroids = rdd_index.map(lambda x: (x[0], (x[1], centroids)))
+        # find the closest cluster for each instance using calculate distance and assign centroid function
+        # -> (index, (row data [point], closest cluster index))
+        rdd_with_cluster = rdd_with_centroids.map(lambda x: (x[0], (x[1][0], calculate_distance_and_assign_centroid(x[1][0], x[1][1]))))
+        # now remove the index and add a unit value to each instance (to count the number of instances in each cluster)
+        # -> (closest cluster index, (row data [point], 1))
+        rdd_with_cluster = rdd_with_cluster.map(lambda x: (x[1][1], (x[1][0], 1)))
+        # now reduce the key value pairs based on the cluster index and add the points and unit values
+        # -> (closest cluster index, (sum(row data {sum of all points}, count of points in this cluster)))
+        rdd_per_cluster = rdd_with_cluster.reduceByKey(lambda y1, y2: (np.array(y1[0]) + np.array(y2[0]), y1[1] + y2[1]))
+        # find the mean values using sum of the points data and count and use them as new centroids
+        # -> (closest cluster index, new centroid point)
+        new_centroids = rdd_per_cluster.map(lambda x: (x[0], (np.array(x[1][0]) / x[1][1]))).map(lambda x: x[1].tolist()).collect()
+        # print(new_centroids)
+        # if the new centroids are same as the previous centroids -> break the loop
+        if is_clusters_same(centroids, new_centroids):
+            break
+        centroids = new_centroids
+    return centroids
+
+
+
+mapped_df1.select("days","order_dow","order_dow_updated").display()
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.feature import VectorAssembler
+from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType
+from pyspark.sql.types import FloatType
+
+
+def find_k(data):
+    # Ensure the "order_hour_of_day" column is cast to integer data type
+    column_name = "order_hour_of_day"
+    data = data.withColumn("order_hour_of_day", col("order_hour_of_day").cast("integer"))
+    
+    vec_Assembler = VectorAssembler(inputCols=[column_name], outputCol="features")
+    data_features = vec_Assembler.transform(data)
+
+    k_values = range(2, 12)
+    wcss_values = []
+
+    for k in k_values:
+        kmeans = KMeans(k=k, seed=1)
+        model = kmeans.fit(data_features)
+        centroids = model.clusterCenters()
+        
+        # Calculate WCSS using the centroids
+        wcss = data_features.rdd.map(lambda x: min([np.linalg.norm(x['features'] - c) for c in centroids])) \
+                                .map(lambda x: x**2).reduce(lambda x, y: x + y)
+        wcss_values.append(wcss)
+    
+    # Calculate the elbow point
+    deltas = np.diff(wcss_values, 2)
+    elbow_index = np.argmin(deltas) + 1
+
+    # Plot the WCSS values to find the elbow point
+    plt.plot(k_values, wcss_values, marker='o')
+    plt.title('Elbow Method for Optimal k')
+    plt.xlabel('Number of Clusters (k)')
+    plt.ylabel('Within-Cluster Sum of Squares (WCSS)')
+    plt.xticks(k_values)
+    plt.grid(True)
+    plt.show()
+
+    # Return the optimal k value
+    return elbow_index + 1
+
+
+
+optimal_k=find_k(mapped_df1)
+
+
+transformed_df = mapped_df1.withColumn("order_hour_of_day_updated",col("order_hour_of_day"))
+
+transformed_df.display()
+
+
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.clustering import KMeans
+from pyspark.sql.functions import col
+
+# Convert the column to integer type
+transformed_df = transformed_df.withColumn("order_hour_of_day_updated", col("order_hour_of_day_updated").cast("integer"))
+transformed_df = transformed_df.withColumn("order_dow_updated", col("order_dow_updated").cast("integer"))
+
+
+transformed_df.select("order_hour_of_day_updated", "order_dow_updated").display()
+
+
+# We know optimal k value using wcss method is 4 but we want to try it for k=3 as well 
+# k means class takes dataframe, k value and iterations.
+# order_hour_of_day and order_day_of_week
+transformed_df_3 = transformed_df.withColumn("order_dow", col("order_dow").cast("integer"))
+centroids_hour_day_3 = kmeans(transformed_df_3.select("order_hour_of_day_updated", "order_dow"), 3, 10)
+
+
+
+# We know optimal k value using wcss method is 4 but we want to try it for k=3 as well 
+# k means class takes dataframe, k value and iterations.
+# departmentId and order_day_of_week
+transformed_df = transformed_df.withColumn("order_dow", col("order_dow").cast("integer"))
+transformed_df = transformed_df.withColumn("department_id", col("department_id").cast("integer"))
+centroids_department_3 = kmeans(transformed_df.select("order_dow","department_id"), 3, 10)
+
+
+
+# hour and day
+# k=3
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Define the range for the heatmap
+x_min, x_max = min(x), max(x)
+y_min, y_max = min(y), max(y)
+
+# Create a 2D histogram
+plt.figure(figsize=(8, 6))
+plt.hist2d(x, y, bins=30, cmap='viridis')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day_3]
+centroids_y = [centroid[1] for centroid in centroids_hour_day_3]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.colorbar(label='Number of Data Points')
+plt.title('Density plot K=3 HourOfDay v/s DayOfWeek')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+# hour and day
+# k=3
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Plot the scatter plot
+plt.figure(figsize=(8, 6))
+plt.scatter(x, y, alpha=0.5, color='skyblue', label='Data Points')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day_3]
+centroids_y = [centroid[1] for centroid in centroids_hour_day_3]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.title('Scatter Plot of HourOfDay v/s DayOfWeek')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+
+# hour and day
+# k=3
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Extract cluster labels for each data point
+cluster_labels = [calculate_distance_and_assign_centroid((x[i], y[i]), centroids_hour_day_3) for i in range(len(x))]
+
+# Define colors for each cluster
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+# Plot the scatter plot with different colors for each cluster
+plt.figure(figsize=(8, 6))
+for i in range(len(centroids_hour_day_3)):
+    plt.scatter(x=np.array(x)[np.array(cluster_labels)==i], y=np.array(y)[np.array(cluster_labels)==i], 
+                alpha=0.5, color=colors[i], label=f'Cluster {i+1}')
+    
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day_3]
+centroids_y = [centroid[1] for centroid in centroids_hour_day_3]
+plt.scatter(centroids_x, centroids_y, marker='x', color='black', s=100, label='Centroids')
+
+plt.title('Scatter Plot of HourOfDay v/s DayOfWeek')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+
+
+# day and department
+# k=3
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Define the range for the heatmap
+x_min, x_max = min(x), max(x)
+y_min, y_max = min(y), max(y)
+
+# Create a 2D histogram
+plt.figure(figsize=(8, 6))
+plt.hist2d(x, y, bins=30, cmap='viridis')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_3]
+centroids_y = [centroid[1] for centroid in centroids_department_3]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.colorbar(label='Number of Data Points')
+plt.title('Density of DayOfOrder v/s DepartmentId')
+plt.ylabel('Department Id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+# day and department
+k=3
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Plot the scatter plot
+plt.figure(figsize=(8, 6))
+plt.scatter(x, y, alpha=0.5, color='skyblue', label='Data Points')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_3]
+centroids_y = [centroid[1] for centroid in centroids_department_3]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.title('Scatter Plot DayOfOrder v/s DepartmendId')
+plt.ylabel('department_id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+
+
+
+# day and department
+# k=3
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Extract cluster labels for each data point
+cluster_labels = [calculate_distance_and_assign_centroid((x[i], y[i]), centroids_department_3) for i in range(len(x))]
+
+# Define colors for each cluster
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+# Plot the scatter plot with different colors for each cluster
+plt.figure(figsize=(8, 6))
+for i in range(len(centroids_department_3)):
+    plt.scatter(x=np.array(x)[np.array(cluster_labels)==i], y=np.array(y)[np.array(cluster_labels)==i], 
+                alpha=0.5, color=colors[i], label=f'Cluster {i+1}')
+    
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_3]
+centroids_y = [centroid[1] for centroid in centroids_department_3]
+plt.scatter(centroids_x, centroids_y, marker='x', color='black', s=100, label='Centroids')
+
+plt.title('Scatter Plot DayOfWeek v/s DepartmentId')
+plt.ylabel('department_id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+
+# Run K-means clustering
+# here 4 is the optimal_k value we are getting
+# k means class takes dataframe, k value and iterations.
+transformed_df = transformed_df.withColumn("order_dow", col("order_dow").cast("integer"))
+centroids_hour_day = kmeans(transformed_df.select("order_hour_of_day_updated", "order_dow"), 4, 10)
+
+
+
+
+# Run K-means clustering
+transformed_df = transformed_df.withColumn("order_dow", col("order_dow").cast("integer"))
+transformed_df = transformed_df.withColumn("department_id", col("department_id").cast("integer"))
+centroids_department_day = kmeans(transformed_df.select("order_dow","department_id"), 4, 20)
+
+
+
+# hour and day
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Define the range for the heatmap
+x_min, x_max = min(x), max(x)
+y_min, y_max = min(y), max(y)
+
+# Create a 2D histogram
+plt.figure(figsize=(8, 6))
+plt.hist2d(x, y, bins=30, cmap='viridis')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day]
+centroids_y = [centroid[1] for centroid in centroids_hour_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.colorbar(label='Number of Data Points')
+plt.title('Density of Data Points around Centroids')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+
+
+# hour and day
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Plot the scatter plot
+plt.figure(figsize=(8, 6))
+plt.scatter(x, y, alpha=0.5, color='skyblue', label='Data Points')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day]
+centroids_y = [centroid[1] for centroid in centroids_hour_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.title('Scatter Plot of Data Points with Centroids')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# hour and day
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Extract cluster labels for each data point
+cluster_labels = [calculate_distance_and_assign_centroid((x[i], y[i]), centroids_hour_day) for i in range(len(x))]
+
+# Define colors for each cluster
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+# Plot the scatter plot with different colors for each cluster
+plt.figure(figsize=(8, 6))
+for i in range(len(centroids_hour_day)):
+    plt.scatter(x=np.array(x)[np.array(cluster_labels)==i], y=np.array(y)[np.array(cluster_labels)==i], 
+                alpha=0.5, color=colors[i], label=f'Cluster {i+1}')
+    
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day]
+centroids_y = [centroid[1] for centroid in centroids_hour_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='black', s=100, label='Centroids')
+
+plt.title('Scatter Plot of Data Points with Centroids')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# day and department
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Define the range for the heatmap
+x_min, x_max = min(x), max(x)
+y_min, y_max = min(y), max(y)
+
+# Create a 2D histogram
+plt.figure(figsize=(8, 6))
+plt.hist2d(x, y, bins=30, cmap='viridis')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_day]
+centroids_y = [centroid[1] for centroid in centroids_department_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.colorbar(label='Number of Data Points')
+plt.title('Density of Data Points around Centroids')
+plt.ylabel('Department Id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+# day and department
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Plot the scatter plot
+plt.figure(figsize=(8, 6))
+plt.scatter(x, y, alpha=0.5, color='skyblue', label='Data Points')
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_day]
+centroids_y = [centroid[1] for centroid in centroids_department_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+
+plt.title('Scatter Plot of Data Points with Centroids')
+plt.ylabel('department_id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+# day and department
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Extract cluster labels for each data point
+cluster_labels = [calculate_distance_and_assign_centroid((x[i], y[i]), centroids_department_day) for i in range(len(x))]
+
+# Define colors for each cluster
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+# Plot the scatter plot with different colors for each cluster
+plt.figure(figsize=(8, 6))
+for i in range(len(centroids_department_day)):
+    plt.scatter(x=np.array(x)[np.array(cluster_labels)==i], y=np.array(y)[np.array(cluster_labels)==i], 
+                alpha=0.5, color=colors[i], label=f'Cluster {i+1}')
+    
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_day]
+centroids_y = [centroid[1] for centroid in centroids_department_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='black', s=100, label='Centroids')
+
+plt.title('Scatter Plot of Data Points with Centroids')
+plt.ylabel('department_id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+# We know optimal k value using wcss method is 4 but we want to try it for k=5 as well 
+# k means class takes dataframe, k value and iterations.
+# order_hour_of_day and order_day_of_week
+transformed_df_5 = transformed_df.withColumn("order_dow", col("order_dow").cast("integer"))
+centroids_hour_day_5 = kmeans(transformed_df_5.select("order_hour_of_day_updated", "order_dow"), 5, 10)
+
+
+# Run K-means clustering
+transformed_df = transformed_df.withColumn("order_dow", col("order_dow").cast("integer"))
+transformed_df = transformed_df.withColumn("department_id", col("department_id").cast("integer"))
+centroids_department_5 = kmeans(transformed_df.select("order_dow","department_id"), 5, 20)
+
+
+
+# hour and day
+# k=5
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Define the range for the heatmap
+x_min, x_max = min(x), max(x)
+y_min, y_max = min(y), max(y)
+
+# Create a 2D histogram
+plt.figure(figsize=(8, 6))
+plt.hist2d(x, y, bins=30, cmap='viridis')
+
+
+test=[(11, 0), (18, 2), (19, 6), (13, 6), (17, 1)]
+test_x = [centroid[0] for centroid in test]
+test_y = [centroid[1] for centroid in test]
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day_5]
+centroids_y = [centroid[1] for centroid in centroids_hour_day_5]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+plt.scatter(test_x, test_y, marker='o', color='orange', s=100, label='Start_Centroids')
+
+plt.colorbar(label='Number of Data Points')
+plt.title('Density of Data Points around Centroids')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+# hour and day
+# k=5
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Plot the scatter plot
+plt.figure(figsize=(8, 6))
+plt.scatter(x, y, alpha=0.5, color='skyblue', label='Data Points')
+
+test=[(11, 0), (18, 2), (19, 6), (13, 6), (17, 1)]
+test_x = [centroid[0] for centroid in test]
+test_y = [centroid[1] for centroid in test]
+
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day_5]
+centroids_y = [centroid[1] for centroid in centroids_hour_day_5]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+plt.scatter(test_x, test_y, marker='o', color='orange', s=100, label='Start_Centroids')
+
+plt.title('Scatter Plot dayOfWeek v/s HourOfDay')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+
+
+# hour and day
+# k=5
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_hour_of_day_updated", "order_dow").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Extract cluster labels for each data point
+cluster_labels = [calculate_distance_and_assign_centroid((x[i], y[i]), centroids_hour_day) for i in range(len(x))]
+
+# Define colors for each cluster
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+# Plot the scatter plot with different colors for each cluster
+plt.figure(figsize=(8, 6))
+for i in range(len(centroids_hour_day)):
+    plt.scatter(x=np.array(x)[np.array(cluster_labels)==i], y=np.array(y)[np.array(cluster_labels)==i], 
+                alpha=0.5, color=colors[i], label=f'Cluster {i+1}')
+
+test=[(11, 0), (18, 2), (19, 6), (13, 6), (17, 1)]
+test_x = [centroid[0] for centroid in test]
+test_y = [centroid[1] for centroid in test]
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_hour_day]
+centroids_y = [centroid[1] for centroid in centroids_hour_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='black', s=100, label='Centroids')
+plt.scatter(test_x, test_y, marker='o', color='black', s=100, label='Starting_Centroids')
+
+plt.title('Scatter Plot dayOfWeek v/s HourOfDay')
+plt.xlabel('Order Hour of Day (Updated)')
+plt.ylabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+# day and department
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Define the range for the heatmap
+x_min, x_max = min(x), max(x)
+y_min, y_max = min(y), max(y)
+
+# Create a 2D histogram
+plt.figure(figsize=(8, 6))
+plt.hist2d(x, y, bins=30, cmap='viridis')
+test=[(6, 4), (5, 16), (6, 4), (6, 7), (0, 19)]
+test_x = [centroid[0] for centroid in test]
+test_y = [centroid[1] for centroid in test]
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_5]
+centroids_y = [centroid[1] for centroid in centroids_department_5]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+plt.scatter(test_x, test_y, marker='o', color='orange', s=100, label='Start_Centroids')
+
+plt.colorbar(label='Number of Data Points')
+plt.title('Density of Data DayOfOrder v/s Department_id')
+plt.ylabel('Department Id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+# day and department
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Plot the scatter plot
+plt.figure(figsize=(8, 6))
+plt.scatter(x, y, alpha=0.5, color='skyblue', label='Data Points')
+
+test=[(6, 4), (5, 16), (6, 4), (6, 7), (0, 19)]
+test_x = [centroid[0] for centroid in test]
+test_y = [centroid[1] for centroid in test]
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_day]
+centroids_y = [centroid[1] for centroid in centroids_department_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='red', s=100, label='Centroids')
+plt.scatter(test_x, test_y, marker='o', color='orange', s=100, label='Start_Centroids')
+
+plt.title('Scatter Plot of DayOfWeek v/s Department_Id')
+plt.ylabel('department_id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+
+
+
+# day and department
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Extract the features from the DataFrame
+features = transformed_df.select("order_dow", "department_id").collect()
+
+# Extract x and y coordinates for plotting
+x = [f[0] for f in features]
+y = [f[1] for f in features]
+
+# Extract cluster labels for each data point
+cluster_labels = [calculate_distance_and_assign_centroid((x[i], y[i]), centroids_department_day) for i in range(len(x))]
+
+# Define colors for each cluster
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+# Plot the scatter plot with different colors for each cluster
+plt.figure(figsize=(8, 6))
+for i in range(len(centroids_department_day)):
+    plt.scatter(x=np.array(x)[np.array(cluster_labels)==i], y=np.array(y)[np.array(cluster_labels)==i], 
+                alpha=0.5, color=colors[i], label=f'Cluster {i+1}')
+
+
+test=[(6, 4), (5, 16), (6, 4), (6, 7), (0, 19)]
+test_x = [centroid[0] for centroid in test]
+test_y = [centroid[1] for centroid in test]
+# Plot the centroids
+centroids_x = [centroid[0] for centroid in centroids_department_day]
+centroids_y = [centroid[1] for centroid in centroids_department_day]
+plt.scatter(centroids_x, centroids_y, marker='x', color='black', s=100, label='Centroids')
+plt.scatter(test_x, test_y, marker='+', color='black', s=100, label='Start_Centroids')
+
+plt.title('Scatter Plot DayOfWeek v/s DeparmentId')
+plt.ylabel('department_id')
+plt.xlabel('Order Day of Week (Updated)')
+plt.legend()
+plt.grid(False)
+plt.show()
+
+
+
